@@ -110,9 +110,24 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as proxy_socket:
             print("Headers:", request.headers)
             print("Body:", request.body)
             
-            # with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-            #     # Connect to the target server
-            #     server_socket.connect((url, 80))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+                host = request.headers.get('Host', 'localhost')
+                server_port = 80  # Default HTTP port
+                server_socket.connect((host, server_port))
+                # Send the request to the server
+                server_socket.sendall(data)
+                # Receive the response from the server
+                response_data = b""
+                while True:
+                    chunk = server_socket.recv(4096)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                # Parse the response from the server
+                response = parse_http_response(response_data)
+                print(response)
+                print("Response Headers:", response.headers)
+                print("Response Body:", response.body)
 
             # Here you would handle the request and send a response
             # prepare body
