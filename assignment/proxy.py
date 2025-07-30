@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 import sys
 import socket
+import select
 from typing import Dict, Tuple
 
-# --- Argument parsing ---
+# parse cli arguments
 if len(sys.argv) != 5:
     print("Usage: python proxy.py <port> <timeout> <max_object_size> <max_cache_size>")
     sys.exit(1)
@@ -13,6 +13,7 @@ TIMEOUT = int(sys.argv[2])
 MAX_OBJECT_SIZE = int(sys.argv[3])
 MAX_CACHE_SIZE = int(sys.argv[4])
 
+# error handling for args
 if not (1 <= PORT <= 65535):
     print("Port must be between 1 and 65535")
     sys.exit(1)
@@ -25,7 +26,7 @@ if MAX_OBJECT_SIZE < 1 or MAX_CACHE_SIZE < MAX_OBJECT_SIZE:
 
 HOST = '127.0.0.1'
 
-# --- HTTP data classes ---
+# models for http req and res
 class HTTPRequest:
     def __init__(self, method: str, url: str, version: str):
         self.method = method
@@ -34,7 +35,7 @@ class HTTPRequest:
         self.headers: Dict[str,str] = {}
         self.body: bytes = b''
     def __str__(self) -> str:
-        return f"{self.method} {self.url} {self.version}"  
+        return f"{self.method} {self.url} {self.version}"
 
 class HTTPResponse:
     def __init__(self, version: str, status_code: int, reason: str):
@@ -44,9 +45,9 @@ class HTTPResponse:
         self.headers: Dict[str,str] = {}
         self.body: bytes = b''
     def __str__(self) -> str:
-        return f"{self.version} {self.status_code} {self.reason}"  
+        return f"{self.version} {self.status_code} {self.reason}"
 
-# --- Helpers for framing ---
+# receive data from socket until a delimiter is found (used to extract HTTP headers)
 def recv_until(sock: socket.socket, delim: bytes = b"\r\n\r\n") -> bytes:
     buf = bytearray()
     while delim not in buf:
@@ -56,6 +57,7 @@ def recv_until(sock: socket.socket, delim: bytes = b"\r\n\r\n") -> bytes:
         buf.extend(chunk)
     return bytes(buf)
 
+# receive exact number of bytes from socket (used to read req/res body after we know Content-Length)
 def recv_exact(sock: socket.socket, length: int) -> bytes:
     buf = bytearray()
     while len(buf) < length:
@@ -65,13 +67,14 @@ def recv_exact(sock: socket.socket, length: int) -> bytes:
         buf.extend(chunk)
     return bytes(buf)
 
-# --- Parsing ---
+# split raw HTTP request/response into head and body
 def _split_head_body(raw: bytes) -> Tuple[bytes,bytes]:
     parts = raw.split(b"\r\n\r\n", 1)
-    if len(parts)==2:
+    if len(parts) == 2:
         return parts[0], parts[1]
     return parts[0], b''
 
+# parse http req into object
 def parse_http_request(raw: bytes) -> HTTPRequest:
     head, body = _split_head_body(raw)
     request_line, header_block = head.split(b"\r\n",1)
@@ -80,10 +83,11 @@ def parse_http_request(raw: bytes) -> HTTPRequest:
     for line in header_block.decode('ascii').split("\r\n"):
         if not line: continue
         key,val = line.split(': ',1)
-        req.headers[key]=val
+        req.headers[key] = val
     req.body = body
     return req
 
+# parse http res into object
 def parse_http_response(raw: bytes) -> HTTPResponse:
     head, body = _split_head_body(raw)
     status_line, header_block = head.split(b"\r\n",1)
@@ -95,11 +99,11 @@ def parse_http_response(raw: bytes) -> HTTPResponse:
     for line in header_block.decode('ascii').split("\r\n"):
         if not line: continue
         key,val = line.split(': ',1)
-        resp.headers[key]=val
+        resp.headers[key] = val
     resp.body = body
     return resp
 
-# --- URL split ---
+# split url into host:port and path
 def split_url(url: str) -> Tuple[str,str]:
     if url.startswith("http://"): rest = url[7:]
     elif url.startswith("https://"): rest = url[8:]
@@ -109,15 +113,15 @@ def split_url(url: str) -> Tuple[str,str]:
     path = '/' + parts[1] if len(parts)==2 else '/'
     return host_port, path
 
-# --- Client handler ---
+# handle client connection
 def handle_client(client_conn: socket.socket):
     try:
-        # ---- Read and parse client request ----
+        # read request from client
         req_buf = recv_until(client_conn)
         if not req_buf: return
         head, body = _split_head_body(req_buf)
         req = parse_http_request(req_buf)
-        # read remaining request-body if any
+        # if request contains a body, read it
         if 'Content-Length' in req.headers and req.method not in ('GET','HEAD'):
             total = int(req.headers['Content-Length'])
             already = len(body)
@@ -127,7 +131,33 @@ def handle_client(client_conn: socket.socket):
         else:
             req.body = b''
 
-        # ---- Transform request headers ----
+        # handle connect method
+        if req.method == 'CONNECT':
+            host_port = req.url
+            host, port_str = host_port.split(':', 1)
+            port = int(port_str)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
+                server_sock.settimeout(TIMEOUT)
+                server_sock.connect((host, port))
+                resp_line = f"{req.version} 200 Connection Established\r\n"
+                resp_line += f"Via: 1.1 z5592060\r\nConnection: close\r\n\r\n"
+                client_conn.sendall(resp_line.encode('ascii'))
+                sockets = [client_conn, server_sock]
+                # loop to constantly send and receive data
+                while True:
+                    rlist, _, _ = select.select(sockets, [], [])
+                    if client_conn in rlist:
+                        data = client_conn.recv(4096)
+                        if not data: break
+                        server_sock.sendall(data)
+                    if server_sock in rlist:
+                        data = server_sock.recv(4096)
+                        if not data: break
+                        client_conn.sendall(data)
+            return
+
+        # other methods get, post, put
+        # format headers
         req.headers.pop('Proxy-Connection', None)
         req.headers.pop('Connection', None)
         req.headers['Connection'] = 'close'
@@ -137,7 +167,7 @@ def handle_client(client_conn: socket.socket):
         else:
             req.headers['Via'] = via
 
-        # ---- Extract host, port, path ----
+        # extract the origin form
         host_port, path = split_url(req.url)
         if ':' in host_port:
             host,port_str = host_port.split(':',1)
@@ -146,34 +176,33 @@ def handle_client(client_conn: socket.socket):
             host = host_port; port = 80
         req.headers['Host'] = host_port
 
-        # ---- Build and forward request ----
+        # rebuild the request line and forward it to the server
         request_line = f"{req.method} {path} {req.version}\r\n"
         hdrs = ''.join(f"{k}: {v}\r\n" for k,v in req.headers.items())
         forward_data = (request_line + hdrs + '\r\n').encode('ascii') + req.body
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
             server_sock.settimeout(TIMEOUT)
-            server_sock.connect((host,port))
+            server_sock.connect((host, port))
             server_sock.sendall(forward_data)
 
-            # ---- Read and parse server response headers ----
+            # receive response from server
             resp_hdr_buf = recv_until(server_sock)
             head_s, rest = _split_head_body(resp_hdr_buf)
             res = parse_http_response(resp_hdr_buf)
             body_buf = bytearray(rest)
 
-            # ---- Read response body ----
-            # no-body cases
-            if req.method=='HEAD' or 100<=res.status_code<200 or res.status_code in (204,304):
+            # if head method or 1xx,204,304 status codes, no body
+            if req.method == 'HEAD' or 100 <= res.status_code < 200 or res.status_code in (204,304):
                 full_body = b''
-            # Content-Length
+            # if Content-Length header, read exact bytes
             elif 'Content-Length' in res.headers:
                 total = int(res.headers['Content-Length'])
                 needed = total - len(rest)
-                if needed>0:
+                if needed > 0:
                     body_buf.extend(recv_exact(server_sock, needed))
                 full_body = bytes(body_buf)
-            # chunked
-            elif res.headers.get('Transfer-Encoding','').lower()=='chunked':
+            # if Transfer-Encoding is chunked, read chunks until size 0
+            elif res.headers.get('Transfer-Encoding','').lower() == 'chunked':
                 buf = body_buf
                 while True:
                     size_line = recv_until(server_sock, b'\r\n')
@@ -181,12 +210,11 @@ def handle_client(client_conn: socket.socket):
                     size = int(size_line.split(b';',1)[0],16)
                     chunk = recv_exact(server_sock, size+2)
                     buf.extend(chunk)
-                    if size==0:
+                    if size == 0:
                         trailer = recv_until(server_sock)
                         buf.extend(trailer)
                         break
                 full_body = bytes(buf)
-            # until close
             else:
                 while True:
                     chunk = server_sock.recv(4096)
@@ -194,7 +222,7 @@ def handle_client(client_conn: socket.socket):
                     body_buf.extend(chunk)
                 full_body = bytes(body_buf)
 
-        # ---- Transform and send response back ----
+        # send response back to client
         res.headers.pop('Proxy-Connection', None)
         res.headers['Connection'] = 'close'
         vis = res.headers.get('Via','')
@@ -202,14 +230,14 @@ def handle_client(client_conn: socket.socket):
         status = f"{res.version} {res.status_code} {res.reason}\r\n"
         hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
         client_conn.sendall(status.encode('ascii') + hdr_lines.encode('ascii') + b"\r\n" + full_body)
-
     except Exception as e:
         print(f"Error handling client: {e}")
     finally:
         client_conn.close()
 
-# --- Main loop ---
+# main
 def main():
+    # start proxy server
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as proxy_sock:
         proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         proxy_sock.bind((HOST, PORT))
