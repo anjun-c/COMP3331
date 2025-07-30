@@ -108,7 +108,7 @@ def split_url(url: str) -> Tuple[str, str]:
 
 def handle_client(client_conn: socket.socket):
     try:
-        # receive request from client
+        # receive the request from the client until we have the full header
         header_bytes = b''
         while True:
             chunk = client_conn.recv(4096)
@@ -122,9 +122,10 @@ def handle_client(client_conn: socket.socket):
             if b'\r\n\r\n' in header_bytes:
                 break
         
+        # parse the header to see whether there is a body
         head, body = _split_head_body(header_bytes)
         req = parse_http_request(head + b'\r\n\r\n' + body)
-        req.body = body
+        # if there is a body, read it until the specified Content-Length
         if 'Content-Length' in req.headers and req.method not in ['GET', 'HEAD']:
             content_length = int(req.headers['Content-Length'])
             while len(req.body) < content_length:
@@ -132,7 +133,15 @@ def handle_client(client_conn: socket.socket):
                 if not chunk:
                     break
                 req.body += chunk
+                if len(req.body) > MAX_OBJECT_SIZE:
+                    print("Request body exceeds max object size, closing connection.")
+                    client_conn.close()
+                    return
+        # if the body is empty, set it to an empty byte string
+        else:
+            req.body = b''
 
+        # debug output
         print(f"Request: {req}")
         print(f"Headers: {req.headers}")
         print(f"Body: {req.body.decode('utf-8', errors='ignore')}")
@@ -164,9 +173,55 @@ def handle_client(client_conn: socket.socket):
             print(f"Forward data: {forward_data.decode('ascii', errors='ignore')}")
             server_sock.sendall(forward_data)
             while True:
-                chunk = server_sock.recv(4096)
-                if not chunk:
+                origin_header_bytes = b''
+                while True:
+                    chunk = server_sock.recv(4096)
+                    if not chunk:
+                        break
+                    origin_header_bytes += chunk
+                    if b'\r\n\r\n' in origin_header_bytes:
+                        break
+                
+                if not origin_header_bytes:
+                    print("No response from origin server, closing connection.")
                     break
+                # parse the response from the origin server
+                head, body = _split_head_body(origin_header_bytes)
+                res = parse_http_response(head + b'\r\n\r\n' + body)
+                if req.method == 'HEAD' \
+                or 100 <= res.status_code < 200 \
+                or res.status_code in (204, 304):
+                    res.body = b''  # no body for HEAD or certain status codes
+                elif res.headers.get('Content-Length'):
+                    content_length = int(res.headers['Content-Length'])
+                    while len(res.body) < content_length:
+                        chunk = server_sock.recv(4096)
+                        if not chunk:
+                            break
+                        res.body += chunk
+                        if len(res.body) > MAX_OBJECT_SIZE:
+                            print("Response body exceeds max object size, closing connection.")
+                            client_conn.close()
+                            return
+                elif res.headers.get('Transfer-Encoding') == 'chunked':
+                    while True:
+                        chunk_size_line = server_sock.recv(4096).decode('ascii')
+                        if not chunk_size_line:
+                            break
+                        chunk_size = int(chunk_size_line.strip(), 16)
+                        if chunk_size == 0:
+                            break
+                        chunk = server_sock.recv(chunk_size)
+                        res.body += chunk
+                        if len(res.body) > MAX_OBJECT_SIZE:
+                            print("Response body exceeds max object size, closing connection.")
+                            client_conn.close()
+                            return
+                        # read the trailing CRLF after the chunk
+                        server_sock.recv(2)
+                else:
+                    res.body = b''
+
                 # parse the response from the server
                 response = parse_http_response(chunk)
                 print(f"Response: {response}")
