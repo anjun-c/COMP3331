@@ -2,6 +2,7 @@ import sys
 import socket
 import select
 from typing import Dict, Tuple
+import traceback
 
 # parse cli arguments
 if len(sys.argv) != 5:
@@ -114,7 +115,7 @@ def split_url(url: str) -> Tuple[str,str]:
     return host_port, path
 
 # handle client connection
-def handle_client(client_conn: socket.socket):
+def handle_client_non_persistent(client_conn: socket.socket):
     try:
         # read request from client
         req_buf = recv_until(client_conn)
@@ -130,6 +131,10 @@ def handle_client(client_conn: socket.socket):
             req.body = body
         else:
             req.body = b''
+
+        print(f"Received request: {req}")
+        print(f"Headers: {req.headers}")
+        print(f"Body: {req.body[:100]}... (truncated if long)")
 
         # handle connect method
         if req.method == 'CONNECT':
@@ -191,36 +196,49 @@ def handle_client(client_conn: socket.socket):
             res = parse_http_response(resp_hdr_buf)
             body_buf = bytearray(rest)
 
-            # if head method or 1xx,204,304 status codes, no body
-            if req.method == 'HEAD' or 100 <= res.status_code < 200 or res.status_code in (204,304):
+            try:
+                # if head method or 1xx,204,304 status codes, no body
+                if req.method == 'HEAD' or 100 <= res.status_code < 200 or res.status_code in (204,304):
+                    full_body = b''
+                # if Content-Length header, read exact bytes
+                elif 'Content-Length' in res.headers:
+                    total = int(res.headers['Content-Length'])
+                    needed = total - len(rest)
+                    if needed > 0:
+                        body_buf.extend(recv_exact(server_sock, needed))
+                    full_body = bytes(body_buf)
+                # if Transfer-Encoding is chunked, read chunks until size 0
+                elif res.headers.get('Transfer-Encoding','').lower() == 'chunked':
+                    buf = body_buf
+                    while True:
+                        raw = recv_until(server_sock, b'\r\n')
+                        line, rest = raw.split(b'\r\n', 1)      # line == b'171', rest == the start of the JSON
+                        size = int(line.split(b';',1)[0], 16)  # now size == 0x171 == 369
+                        buf.extend(rest)
+                        chunk = recv_exact(server_sock, size - len(rest) + 2)  # +2 for the trailing CRLF
+                        buf.extend(chunk)
+
+                        if size == 0:
+                            trailer = recv_until(server_sock)
+                            buf.extend(trailer)
+                            break
+                    full_body = bytes(buf)
+                    res.headers.pop('Transfer-Encoding', None)
+                    res.headers['Content-Length'] = str(len(full_body))
+                else:
+                    while True:
+                        chunk = server_sock.recv(4096)
+                        if not chunk: break
+                        body_buf.extend(chunk)
+                    full_body = bytes(body_buf)
+            except Exception as e:
+                print(f"Error reading response body: {e}")
+                traceback.print_exc()
                 full_body = b''
-            # if Content-Length header, read exact bytes
-            elif 'Content-Length' in res.headers:
-                total = int(res.headers['Content-Length'])
-                needed = total - len(rest)
-                if needed > 0:
-                    body_buf.extend(recv_exact(server_sock, needed))
-                full_body = bytes(body_buf)
-            # if Transfer-Encoding is chunked, read chunks until size 0
-            elif res.headers.get('Transfer-Encoding','').lower() == 'chunked':
-                buf = body_buf
-                while True:
-                    size_line = recv_until(server_sock, b'\r\n')
-                    buf.extend(size_line)
-                    size = int(size_line.split(b';',1)[0],16)
-                    chunk = recv_exact(server_sock, size+2)
-                    buf.extend(chunk)
-                    if size == 0:
-                        trailer = recv_until(server_sock)
-                        buf.extend(trailer)
-                        break
-                full_body = bytes(buf)
-            else:
-                while True:
-                    chunk = server_sock.recv(4096)
-                    if not chunk: break
-                    body_buf.extend(chunk)
-                full_body = bytes(body_buf)
+
+        print(f"Received response: {res}")
+        print(f"Headers: {res.headers}")
+        print(f"Body: {full_body[:100]}... (truncated if long)")
 
         # send response back to client
         res.headers.pop('Proxy-Connection', None)
@@ -230,10 +248,18 @@ def handle_client(client_conn: socket.socket):
         status = f"{res.version} {res.status_code} {res.reason}\r\n"
         hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
         client_conn.sendall(status.encode('ascii') + hdr_lines.encode('ascii') + b"\r\n" + full_body)
+
+        print(f"Response sent: {status}")
+        print(f"Headers sent: {hdr_lines}")
+        print(f"Body sent: {full_body[:100]}... (truncated if long)")
     except Exception as e:
         print(f"Error handling client: {e}")
+        traceback.print_exc()
+        client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+        sys.exit(1)
     finally:
         client_conn.close()
+
 
 # main
 def main():
@@ -243,9 +269,8 @@ def main():
         proxy_sock.bind((HOST, PORT))
         proxy_sock.listen()
         print(f"Proxy server listening on {HOST}:{PORT}")
-        while True:
-            client_conn, client_addr = proxy_sock.accept()
-            handle_client(client_conn)
-
+        client_conn, client_addr = proxy_sock.accept()
+        handle_client_non_persistent(client_conn)
+            
 if __name__=='__main__':
     main()
