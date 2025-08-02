@@ -3,6 +3,8 @@ import socket
 import select
 from typing import Dict, Tuple
 import traceback
+import json
+import threading
 
 # parse cli arguments
 if len(sys.argv) != 5:
@@ -51,8 +53,12 @@ class HTTPResponse:
 # receive data from socket until a delimiter is found (used to extract HTTP headers)
 def recv_until(sock: socket.socket, delim: bytes = b"\r\n\r\n") -> bytes:
     buf = bytearray()
+    sock.settimeout(1.0)
     while delim not in buf:
-        chunk = sock.recv(4096)
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
         if not chunk:
             break
         buf.extend(chunk)
@@ -61,8 +67,12 @@ def recv_until(sock: socket.socket, delim: bytes = b"\r\n\r\n") -> bytes:
 # receive exact number of bytes from socket (used to read req/res body after we know Content-Length)
 def recv_exact(sock: socket.socket, length: int) -> bytes:
     buf = bytearray()
+    sock.settimeout(1.0)
     while len(buf) < length:
-        chunk = sock.recv(length - len(buf))
+        try:
+            chunk = sock.recv(length - len(buf))
+        except socket.timeout:
+            continue
         if not chunk:
             break
         buf.extend(chunk)
@@ -118,6 +128,7 @@ def split_url(url: str) -> Tuple[str,str]:
 def handle_client(client_conn: socket.socket):
     try:
         client_conn.settimeout(TIMEOUT)
+        # loop for persistence
         while True:
             # read request from client
             try:
@@ -142,9 +153,12 @@ def handle_client(client_conn: socket.socket):
             client_conn_hdr = req.headers.get('Connection')
             client_proxy_hdr = req.headers.get('Proxy-Connection')
 
+            print("----------------- RECIEVED REQUEST FROM CLIENT -----------------")
             print(f"Received request: {req}")
-            print(f"Headers: {req.headers}")
+            print("Headers:")
+            print(json.dumps(req.headers, indent=4))
             print(f"Body: {req.body[:100]}... (truncated if long)")
+            print("\n")
 
             # handle connect method
             if req.method == 'CONNECT':
@@ -198,6 +212,14 @@ def handle_client(client_conn: socket.socket):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
                 server_sock.settimeout(TIMEOUT)
                 server_sock.connect((host, port))
+
+                print("----------------- FORWARDING REQUEST TO ORIGIN -----------------")
+                print(f"Forwarding request: {req}")
+                print("Headers:")
+                print(json.dumps(req.headers, indent=4))
+                print(f"Body: {req.body[:100]}... (truncated if long)")
+                print("\n")
+
                 server_sock.sendall(forward_data)
 
                 # receive response from server
@@ -246,57 +268,73 @@ def handle_client(client_conn: socket.socket):
                     traceback.print_exc()
                     full_body = b''
 
-            print(f"Received response: {res}")
-            print(f"Headers: {res.headers}")
+            print("----------------- RECIEVED RESPONSE FROM ORIGIN -----------------")
+            print(f"Response: {res}")
+            print("Headers:")
+            print(json.dumps(res.headers, indent=4))
             print(f"Body: {full_body[:100]}... (truncated if long)")
+            print("\n")
 
             # send response back to client
             res.headers.pop('Proxy-Connection', None)
             res.headers['Via'] = '1.1 z5592060'
-            status = f"{res.version} {res.status_code} {res.reason}\r\n"
-            hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
 
+            # handle Connection and Proxy-Connection headers for persistence
             end_conn = False
             if client_conn_hdr and client_conn_hdr.lower() == 'close':
-                status += "Connection: close\r\n"
+                res.headers['Connection'] = 'close'
                 end_conn = True
             if client_proxy_hdr and client_proxy_hdr.lower() == 'close':
-                status += "Proxy-Connection: close\r\n"
+                res.headers['Proxy-Connection'] = 'close'
                 end_conn = True
             if client_conn_hdr and client_conn_hdr.lower() == 'keep-alive':
-                status += "Connection: keep-alive\r\n"
+                res.headers['Connection'] = 'keep-alive'
             if client_proxy_hdr and client_proxy_hdr.lower() == 'keep-alive':
-                status += "Proxy-Connection: keep-alive\r\n"
+                res.headers['Proxy-Connection'] = 'keep-alive'
 
+            status = f"{res.version} {res.status_code} {res.reason}\r\n"
+            hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
             client_conn.sendall(status.encode('ascii') + hdr_lines.encode('ascii') + b"\r\n" + full_body)
 
             if end_conn:
                 break
 
-            print(f"Response sent: {status}")
-            print(f"Headers sent: {hdr_lines}")
-            print(f"Body sent: {full_body[:100]}... (truncated if long)")
+            print("----------------- FORWARDING RESPONSE TO CLIENT -----------------")
+            print(f"Response: {res}")
+            print("Headers:")
+            print(json.dumps(res.headers, indent=4))
+            print(f"Body: {full_body[:100]}... (truncated if long)")
+            print("\n")
     except Exception as e:
         print(f"Error handling client: {e}")
         traceback.print_exc()
         client_conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
-        sys.exit(1)
     finally:
         client_conn.close()
 
 
 # main
 def main():
-    # start proxy server
+    # start the proxy server
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as proxy_sock:
         proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         proxy_sock.bind((HOST, PORT))
         proxy_sock.listen()
-        # loop for persistence
-        while True:
-            print(f"Proxy server listening on {HOST}:{PORT}")
-            client_conn, client_addr = proxy_sock.accept()
-            handle_client(client_conn)
+        # set timeout for 1s so that Ctrl+C can go through
+        proxy_sock.settimeout(1.0)
+        print(f"Proxy server listening on {HOST}:{PORT}")    # only once
+
+        # main loop to accept connections
+        try:
+            while True:
+                try:
+                    client_conn, client_addr = proxy_sock.accept()
+                except socket.timeout:
+                    continue
+                print(f"Accepted connection from {client_addr}")  # log every new TCP handshake
+                handle_client(client_conn)
+        except KeyboardInterrupt:
+            print("\nShutting down server... (Ctrl+C)")
             
 if __name__=='__main__':
     main()
