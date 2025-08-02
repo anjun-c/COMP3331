@@ -110,13 +110,16 @@ def _split_head_body(raw: bytes) -> Tuple[bytes,bytes]:
 # parse http req into object
 def parse_http_request(raw: bytes) -> HTTPRequest:
     head, body = _split_head_body(raw)
-    request_line, header_block = head.split(b"\r\n",1)
+    parts = head.split(b"\r\n", 1)
+    if len(parts) < 2:
+        raise ValueError("malformed request head")
+    request_line, header_block = parts
     method, url, version = request_line.decode('ascii').split(' ',2)
     req = HTTPRequest(method, url, version)
     for line in header_block.decode('ascii').split("\r\n"):
         if not line: continue
         key,val = line.split(': ',1)
-        req.headers[key] = val
+        req.headers[key.lower()] = val
     req.body = body
     return req
 
@@ -132,7 +135,7 @@ def parse_http_response(raw: bytes) -> HTTPResponse:
     for line in header_block.decode('ascii').split("\r\n"):
         if not line: continue
         key,val = line.split(': ',1)
-        resp.headers[key] = val
+        resp.headers[key.lower()] = val
     resp.body = body
     return resp
 
@@ -170,6 +173,25 @@ def send_error_response(client_conn: socket.socket, version: str, code: int, rea
         "\r\n"
     )
     client_conn.sendall(hdrs.encode('ascii') + body)
+
+def send_log_error_response(client_conn, req, code, reason, phrase, cache_flag='-'):
+    body = phrase.encode('ascii')
+    hdrs = (
+        f"{req.version} {code} {reason}\r\n"
+        "Content-Type: text/plain\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    )
+    client_conn.sendall(hdrs.encode('ascii') + body)
+
+    error_res = HTTPResponse(req.version, code, reason)
+    error_res.body = body
+    entry = generate_clf_entry(req, error_res, client_conn.getpeername(), cache_flag)
+    print(entry)
+    with lock:
+        with open('log.log','a') as f:
+            f.write(entry + "\n")
 
 def normalise_url(url: str) -> str:
     if url.startswith("http://"):
@@ -235,10 +257,15 @@ def handle_client(client_conn: socket.socket):
                 return
             if not req_buf: return
             head, body = _split_head_body(req_buf)
-            req = parse_http_request(req_buf)
+            try:
+                req = parse_http_request(req_buf)
+            except ValueError as e:
+                temp = HTTPRequest("GET", "", "HTTP/1.1")
+                send_log_error_response(client_conn, temp, 400, "Bad Request", "malformed request")
+                return
             # if request contains a body, read it
-            if 'Content-Length' in req.headers and req.method not in ('GET','HEAD'):
-                total = int(req.headers['Content-Length'])
+            if 'content-length' in req.headers and req.method not in ('GET','HEAD'):
+                total = int(req.headers['content-length'])
                 already = len(body)
                 if total > already:
                     body += recv_exact(client_conn, total-already)
@@ -246,11 +273,11 @@ def handle_client(client_conn: socket.socket):
             else:
                 req.body = b''
 
-            client_conn_hdr = req.headers.get('Connection')
-            client_proxy_hdr = req.headers.get('Proxy-Connection')
+            client_conn_hdr = req.headers.get('connection')
+            client_proxy_hdr = req.headers.get('proxy-connection')
 
-            if req.headers.get('Host') is None:
-                send_error_response(client_conn, req.version, 400, "Bad Request", "no host")
+            if req.method != 'CONNECT' and req.headers.get('host') is None:
+                send_log_error_response(client_conn, req, 400, "Bad Request", "no host")
                 return
             
             cache_flag = '-'
@@ -288,22 +315,25 @@ def handle_client(client_conn: socket.socket):
                     host, port_str = host_port.split(':', 1)
                     port = int(port_str)
                 except ValueError:
-                    send_error_response(client_conn, req.version, 400, "Bad Request", "invalid port")
+                    send_log_error_response(client_conn, req, 400, "Bad Request", "invalid port")
                     return
                 if port != 443:
-                    send_error_response(client_conn, req.version, 400, "Bad Request", "invalid port")
+                    send_log_error_response(client_conn, req, 400, "Bad Request", "invalid port")
                     return
-                
+                if host in (HOST, '127.0.0.1', 'localhost') and port == PORT:
+                    send_log_error_response(client_conn, req, 421, "Misdirected Request", "proxy address")
+                    return
+
                 # establish TCP tunnel
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
                     server_sock.settimeout(TIMEOUT)
                     try:
                         server_sock.connect((host, port))
                     except socket.gaierror:
-                        send_error_response(client_conn, req.version, 502, "Bad Gateway", "could not resolve")
+                        send_log_error_response(client_conn, req, 502, "Bad Gateway", "could not resolve")
                         return
                     except ConnectionRefusedError:
-                        send_error_response(client_conn, req.version, 502, "Bad Gateway", "connection refused")
+                        send_log_error_response(client_conn, req, 502, "Bad Gateway", "connection refused")
                         return
                     resp_line = f"{req.version} 200 Connection Established\r\n"
                     resp_line += f"Via: 1.1 z5592060\r\nConnection: close\r\n\r\n"
@@ -338,14 +368,14 @@ def handle_client(client_conn: socket.socket):
 
             # other methods get, post, put
             # format headers
-            req.headers.pop('Proxy-Connection', None)
-            req.headers.pop('Connection', None)
-            req.headers['Connection'] = 'close'
+            req.headers.pop('proxy-connection', None)
+            req.headers.pop('connection', None)
+            req.headers['connection'] = 'close'
             via = '1.1 z5592060'
-            if 'Via' in req.headers:
-                req.headers['Via'] += ', ' + via
+            if 'via' in req.headers:
+                req.headers['via'] += ', ' + via
             else:
-                req.headers['Via'] = via
+                req.headers['via'] = via
 
             # extract the origin form
             host_port, path = split_url(req.url)
@@ -354,10 +384,10 @@ def handle_client(client_conn: socket.socket):
                 port = int(port_str)
             else:
                 host = host_port; port = 80
-            req.headers['Host'] = host_port
+            req.headers['host'] = host_port
 
             if host in (HOST, '127.0.0.1', 'localhost') and port == PORT:
-                send_error_response(client_conn, req.version, 421, "Misdirected Request", "proxy address")
+                send_log_error_response(client_conn, req, 421, "Misdirected Request", "proxy address")
                 return
 
             # rebuild the request line and forward it to the server
@@ -369,14 +399,13 @@ def handle_client(client_conn: socket.socket):
                 try: 
                     server_sock.connect((host, port))
                 except socket.timeout:
-                    print(f"Timeout while connecting to {host}:{port}")
-                    send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                    send_log_error_response(client_conn, req, 504, "Gateway Timeout", "timed out")
                     return
                 except ConnectionRefusedError:
-                    send_error_response(client_conn, req.version, 502, "Bad Gateway", "connection refused")
+                    send_log_error_response(client_conn, req, 502, "Bad Gateway", "connection refused")
                     return
                 except socket.gaierror:
-                    send_error_response(client_conn, req.version, 502, "Bad Gateway", "could not resolve")
+                    send_log_error_response(client_conn, req, 502, "Bad Gateway", "could not resolve")
                     return
                 
                 if VERBOSE:
@@ -394,7 +423,7 @@ def handle_client(client_conn: socket.socket):
                     # receive response from server
                     resp_hdr_buf = recv_until(server_sock)
                 except socket.timeout:
-                    send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                    send_log_error_response(client_conn, req, 504, "Gateway Timeout", "timed out")
                     return
                 
                 head_s, rest = _split_head_body(resp_hdr_buf)
@@ -405,24 +434,24 @@ def handle_client(client_conn: socket.socket):
                     # if head method or 1xx,204,304 status codes, no body
                     if req.method == 'HEAD' or 100 <= res.status_code < 200 or res.status_code in (204,304):
                         full_body = b''
-                    # if Content-Length header, read exact bytes
-                    elif 'Content-Length' in res.headers:
-                        total = int(res.headers['Content-Length'])
+                    # if content-length header, read exact bytes
+                    elif 'content-length' in res.headers:
+                        total = int(res.headers['content-length'])
                         needed = total - len(rest)
                         if needed > 0:
                             try:
                                 body_buf.extend(recv_exact(server_sock, needed))
                             except socket.timeout:
-                                send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                                send_log_error_response(client_conn, req, 504, "Gateway Timeout", "timed out")
                                 return
                         
                         if len(body_buf) < total:
-                            send_error_response(client_conn, req.version, 502, "Bad Gateway", "closed unexpectedly")
+                            send_log_error_response(client_conn, req, 502, "Bad Gateway", "closed unexpectedly")
                             return
 
                         full_body = bytes(body_buf)
                     # if Transfer-Encoding is chunked, read chunks until size 0
-                    elif res.headers.get('Transfer-Encoding','').lower() == 'chunked':
+                    elif res.headers.get('transfer-encoding', '').lower() == 'chunked':
                         buf = bytearray()
                         while True:
                             line = b''
@@ -437,22 +466,20 @@ def handle_client(client_conn: socket.socket):
                             try:
                                 size = int(size_str, 16)
                             except ValueError:
-                                send_error_response(client_conn, req.version,
-                                                    502, "Bad Gateway", "closed unexpectedly")
+                                send_log_error_response(client_conn, req, 502, "Bad Gateway", "closed unexpectedly")
                                 return
                             if size == 0:
                                 _ = recv_until(server_sock)
                                 break
                             data = recv_exact(server_sock, size + 2)
                             if len(data) < size + 2:
-                                send_error_response(client_conn, req.version,
-                                                    502, "Bad Gateway", "closed unexpectedly")
+                                send_log_error_response(client_conn, req, 502, "Bad Gateway", "closed unexpectedly")
                                 return
                             buf.extend(data[:-2])
 
                         full_body = bytes(buf)
-                        res.headers.pop('Transfer-Encoding', None)
-                        res.headers['Content-Length'] = str(len(full_body))
+                        res.headers.pop('transfer-encoding', None)
+                        res.headers['content-length'] = str(len(full_body))
                     else:
                         while True:
                             chunk = server_sock.recv(4096)
@@ -460,7 +487,7 @@ def handle_client(client_conn: socket.socket):
                             body_buf.extend(chunk)
                         full_body = bytes(body_buf)
                 except socket.timeout:
-                    send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                    send_log_error_response(client_conn, req, 504, "Gateway Timeout", "timed out")
                     return
                 except Exception as e:
                     print(f"Error reading response body: {e}")
@@ -478,21 +505,21 @@ def handle_client(client_conn: socket.socket):
 
             # send response back to client
             res.body = full_body
-            res.headers.pop('Proxy-Connection', None)
-            res.headers['Via'] = '1.1 z5592060'
+            res.headers.pop('proxy-connection', None)
+            res.headers['via'] = '1.1 z5592060'
 
             # handle Connection and Proxy-Connection headers for persistence
             end_conn = False
             if client_conn_hdr and client_conn_hdr.lower() == 'close':
-                res.headers['Connection'] = 'close'
+                res.headers['connection'] = 'close'
                 end_conn = True
             if client_proxy_hdr and client_proxy_hdr.lower() == 'close':
-                res.headers['Proxy-Connection'] = 'close'
+                res.headers['proxy-connection'] = 'close'
                 end_conn = True
             if client_conn_hdr and client_conn_hdr.lower() == 'keep-alive':
-                res.headers['Connection'] = 'keep-alive'
+                res.headers['connection'] = 'keep-alive'
             if client_proxy_hdr and client_proxy_hdr.lower() == 'keep-alive':
-                res.headers['Proxy-Connection'] = 'keep-alive'
+                res.headers['proxy-connection'] = 'keep-alive'
 
             status = f"{res.version} {res.status_code} {res.reason}\r\n"
             hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
