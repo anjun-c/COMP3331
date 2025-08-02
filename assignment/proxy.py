@@ -6,6 +6,7 @@ import traceback
 import json
 import threading
 import time
+from collections import OrderedDict
 
 # parse cli arguments
 if len(sys.argv) != 5:
@@ -16,7 +17,8 @@ PORT = int(sys.argv[1])
 TIMEOUT = int(sys.argv[2])
 MAX_OBJECT_SIZE = int(sys.argv[3])
 MAX_CACHE_SIZE = int(sys.argv[4])
-VERBOSE = False  # set to True for more detailed output
+
+VERBOSE = True
 
 lock = threading.Lock()
 
@@ -53,6 +55,14 @@ class HTTPResponse:
         self.body: bytes = b''
     def __str__(self) -> str:
         return f"{self.version} {self.status_code} {self.reason}"
+    
+class CacheEntry:
+    def __init__(self, res):
+        self.res = res
+        self.size = len(res.body) if res.body else 0
+
+cache = OrderedDict()
+cache_size = 0
 
 # receive data from socket until a delimiter is found (used to extract HTTP headers)
 def recv_until(sock: socket.socket, delim: bytes = b"\r\n\r\n") -> bytes:
@@ -161,6 +171,52 @@ def send_error_response(client_conn: socket.socket, version: str, code: int, rea
     )
     client_conn.sendall(hdrs.encode('ascii') + body)
 
+def normalise_url(url: str) -> str:
+    if url.startswith("http://"):
+        scheme = "http"
+    elif url.startswith("https://"):
+        scheme = "https"
+    else:
+        scheme = "http"
+    host_port, path = split_url(url)
+
+    if ':' in host_port:
+        host, port_str = host_port.split(':', 1)
+        try:
+            port = int(port_str, 10)
+        except ValueError:
+            port = 80 if scheme == "http" else 443
+    else:
+        host = host_port
+        port = 80 if scheme == "http" else 443
+    host = host.lower()
+
+    return f"{scheme}://{host}:{port}{path}"
+
+def cache_get(key: str):
+    with lock:
+        entry = cache.pop(key, None)
+        if entry:
+            cache[key] = entry
+            return entry.res
+    return None
+
+def cache_put(key: str, response):
+    global cache_size
+    obj_size = len(response.body)
+
+    if response.status_code != 200 or obj_size > MAX_OBJECT_SIZE:
+        return
+
+    with lock:
+        while cache_size + obj_size > MAX_CACHE_SIZE and cache:
+            old_key, old_entry = cache.popitem(last=False)
+            cache_size -= old_entry.size
+        if obj_size > MAX_CACHE_SIZE:
+            return
+        cache[key] = CacheEntry(response)
+        cache_size += obj_size
+
 # handle client connection
 def handle_client(client_conn: socket.socket):
     try:
@@ -197,13 +253,24 @@ def handle_client(client_conn: socket.socket):
                 send_error_response(client_conn, req.version, 400, "Bad Request", "no host")
                 return
             
-            
             cache_flag = '-'
-            cache_hit = False
             if req.method == 'GET':
-                cache_flag = 'H' if cache_hit else 'M'
-            else:
-                cache_flag = '-'
+                cache_key = normalise_url(req.url)
+                cached = cache_get(cache_key)
+                if cached:
+                    cache_flag = 'H'
+                    res = cached
+                    status = f"{res.version} {res.status_code} {res.reason}\r\n"
+                    hdrs = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
+                    client_conn.sendall(status.encode('ascii') + hdrs.encode('ascii') + b"\r\n" + res.body)
+                    log_entry = generate_clf_entry(req, res, client_conn.getpeername(), cache_flag)
+                    print(log_entry)
+                    with lock:
+                        with open('log.log', 'a') as log_file:
+                            log_file.write(log_entry + '\n')
+                    continue
+                else:
+                    cache_flag = 'M'
 
             if VERBOSE:
                 print("----------------- RECEIVED REQUEST FROM CLIENT -----------------")
@@ -356,25 +423,33 @@ def handle_client(client_conn: socket.socket):
                         full_body = bytes(body_buf)
                     # if Transfer-Encoding is chunked, read chunks until size 0
                     elif res.headers.get('Transfer-Encoding','').lower() == 'chunked':
-                        buf = body_buf
+                        buf = bytearray()
                         while True:
-                            raw = recv_until(server_sock, b'\r\n')
-                            if not raw:
-                                send_error_response(client_conn, req.version, 502, "Bad Gateway", "closed unexpectedly")
-                                return
-                            line, rest = raw.split(b'\r\n', 1)
-                            size = int(line.split(b';',1)[0], 16)
-                            buf.extend(rest)
-                            chunk = recv_exact(server_sock, size - len(rest) + 2)
-                            if len(chunk) < size + 2:
-                                send_error_response(client_conn, req.version, 502, "Bad Gateway", "closed unexpectedly")
-                                return
-                            buf.extend(chunk)
-
-                            if size == 0:
-                                trailer = recv_until(server_sock)
-                                buf.extend(trailer)
+                            line = b''
+                            while not line.endswith(b'\r\n'):
+                                byte = server_sock.recv(1)
+                                if not byte:
+                                    break
+                                line += byte
+                            if not line:
                                 break
+                            size_str = line.strip().split(b';',1)[0]
+                            try:
+                                size = int(size_str, 16)
+                            except ValueError:
+                                send_error_response(client_conn, req.version,
+                                                    502, "Bad Gateway", "closed unexpectedly")
+                                return
+                            if size == 0:
+                                _ = recv_until(server_sock)
+                                break
+                            data = recv_exact(server_sock, size + 2)
+                            if len(data) < size + 2:
+                                send_error_response(client_conn, req.version,
+                                                    502, "Bad Gateway", "closed unexpectedly")
+                                return
+                            buf.extend(data[:-2])
+
                         full_body = bytes(buf)
                         res.headers.pop('Transfer-Encoding', None)
                         res.headers['Content-Length'] = str(len(full_body))
@@ -402,6 +477,7 @@ def handle_client(client_conn: socket.socket):
                 print("\n")
 
             # send response back to client
+            res.body = full_body
             res.headers.pop('Proxy-Connection', None)
             res.headers['Via'] = '1.1 z5592060'
 
@@ -420,15 +496,18 @@ def handle_client(client_conn: socket.socket):
 
             status = f"{res.version} {res.status_code} {res.reason}\r\n"
             hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
-            client_conn.sendall(status.encode('ascii') + hdr_lines.encode('ascii') + b"\r\n" + full_body)
+            client_conn.sendall(status.encode('ascii') + hdr_lines.encode('ascii') + b"\r\n" + res.body)
             
+            if req.method == 'GET':
+                cache_put(cache_key, res)
+
             if VERBOSE:
                 print("----------------- FORWARDING RESPONSE TO CLIENT -----------------")
                 print(f"[{thread_name}] Client: {client_conn.getpeername()}")
                 print(f"Response: {res}")
                 print("Headers:")
                 print(json.dumps(res.headers, indent=4))
-                print(f"Body: {full_body[:100]}... (truncated if long)")
+                print(f"Body: {res.body[:100]}... (truncated if long)")
                 print("\n")
 
             # log the request and response

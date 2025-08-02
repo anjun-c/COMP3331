@@ -1,10 +1,4 @@
-127.0.0.1 65045 M [02/Aug/2025:10:46:28 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 0
-127.0.0.1 65094 M [02/Aug/2025:10:47:42 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 406
-127.0.0.1 49309 M [02/Aug/2025:11:07:32 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 254
-127.0.0.1 49312 M [02/Aug/2025:11:07:33 +1000] "GET http://httpbin.org/uuid HTTP/1.1" 200 53
-127.0.0.1 49318 M [02/Aug/2025:11:07:35 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 406
-127.0.0.1 49339 M [02/Aug/2025:11:08:01 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 406
-127.0.0.1 49344 M [02/Aug/2025:11:08:02 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 254
-127.0.0.1 49346 M [02/Aug/2025:11:08:02 +1000] "GET http://httpbin.org/uuid HTTP/1.1" 200 0
-127.0.0.1 49351 M [02/Aug/2025:11:08:05 +1000] "GET http://httpbin.org/get HTTP/1.1" 200 0
-127.0.0.1 49353 M [02/Aug/2025:11:08:05 +1000] "GET http://httpbin.org/uuid HTTP/1.1" 200 53
+127.0.0.1 54289 - [02/Aug/2025:14:06:05 +1000] "HEAD http://httpbin.org/get HTTP/1.1" 200 0
+127.0.0.1 54291 - [02/Aug/2025:14:06:06 +1000] "POST http://httpbin.org/post HTTP/1.1" 200 318
+127.0.0.1 54293 - [02/Aug/2025:14:06:06 +1000] "HEAD http://httpbin.org/get HTTP/1.1" 200 0
+127.0.0.1 54295 - [02/Aug/2025:14:06:07 +1000] "POST http://httpbin.org/post HTTP/1.1" 200 318
