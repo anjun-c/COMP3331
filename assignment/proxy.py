@@ -18,6 +18,8 @@ MAX_OBJECT_SIZE = int(sys.argv[3])
 MAX_CACHE_SIZE = int(sys.argv[4])
 VERBOSE = False  # set to True for more detailed output
 
+lock = threading.Lock()
+
 # error handling for args
 if not (1 <= PORT <= 65535):
     print("Port must be between 1 and 65535")
@@ -56,28 +58,36 @@ class HTTPResponse:
 def recv_until(sock: socket.socket, delim: bytes = b"\r\n\r\n") -> bytes:
     buf = bytearray()
     sock.settimeout(1.0)
+    last_data = time.time()
     while delim not in buf:
         try:
             chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            last_data = time.time()
         except socket.timeout:
+            if time.time() - last_data > TIMEOUT:
+                raise
             continue
-        if not chunk:
-            break
-        buf.extend(chunk)
     return bytes(buf)
 
 # receive exact number of bytes from socket (used to read req/res body after we know Content-Length)
 def recv_exact(sock: socket.socket, length: int) -> bytes:
     buf = bytearray()
     sock.settimeout(1.0)
+    last_data = time.time()
     while len(buf) < length:
         try:
             chunk = sock.recv(length - len(buf))
+            if not chunk:
+                break
+            buf.extend(chunk)
+            last_data = time.time()
         except socket.timeout:
+            if time.time() - last_data > TIMEOUT:
+                raise
             continue
-        if not chunk:
-            break
-        buf.extend(chunk)
     return bytes(buf)
 
 # split raw HTTP request/response into head and body
@@ -139,6 +149,18 @@ def generate_clf_entry(req: HTTPRequest, res: HTTPResponse, client_addr: Tuple[s
         f"{res.status_code} {body_bytes}"
     )
 
+# send error response to client
+def send_error_response(client_conn: socket.socket, version: str, code: int, reason: str, phrase: str):
+    body = phrase.encode('ascii')
+    hdrs = (
+        f"{version} {code} {reason}\r\n"
+        "Content-Type: text/plain\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    )
+    client_conn.sendall(hdrs.encode('ascii') + body)
+
 # handle client connection
 def handle_client(client_conn: socket.socket):
     try:
@@ -151,10 +173,11 @@ def handle_client(client_conn: socket.socket):
             try:
                 req_buf = recv_until(client_conn)
             except socket.timeout:
-                print("Timeout while receiving request")
-                client_conn.sendall(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
-                break
-            if not req_buf: break
+                if VERBOSE:
+                    print("Timeout while receiving request")
+                # return to close the connection
+                return
+            if not req_buf: return
             head, body = _split_head_body(req_buf)
             req = parse_http_request(req_buf)
             # if request contains a body, read it
@@ -169,6 +192,11 @@ def handle_client(client_conn: socket.socket):
 
             client_conn_hdr = req.headers.get('Connection')
             client_proxy_hdr = req.headers.get('Proxy-Connection')
+
+            if req.headers.get('Host') is None:
+                send_error_response(client_conn, req.version, 400, "Bad Request", "no host")
+                return
+            
             
             cache_flag = '-'
             cache_hit = False
@@ -178,7 +206,7 @@ def handle_client(client_conn: socket.socket):
                 cache_flag = '-'
 
             if VERBOSE:
-                print("----------------- RECIEVED REQUEST FROM CLIENT -----------------")
+                print("----------------- RECEIVED REQUEST FROM CLIENT -----------------")
                 print(f"[{thread_name}] Client: {client_conn.getpeername()}")
                 print(f"Received request: {req}")
                 print(f"Headers:")
@@ -189,14 +217,44 @@ def handle_client(client_conn: socket.socket):
             # handle connect method
             if req.method == 'CONNECT':
                 host_port = req.url
-                host, port_str = host_port.split(':', 1)
-                port = int(port_str)
+                try:
+                    host, port_str = host_port.split(':', 1)
+                    port = int(port_str)
+                except ValueError:
+                    send_error_response(client_conn, req.version, 400, "Bad Request", "invalid port")
+                    return
+                if port != 443:
+                    send_error_response(client_conn, req.version, 400, "Bad Request", "invalid port")
+                    return
+                
+                # establish TCP tunnel
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
                     server_sock.settimeout(TIMEOUT)
-                    server_sock.connect((host, port))
+                    try:
+                        server_sock.connect((host, port))
+                    except socket.gaierror:
+                        send_error_response(client_conn, req.version, 502, "Bad Gateway", "could not resolve")
+                        return
+                    except ConnectionRefusedError:
+                        send_error_response(client_conn, req.version, 502, "Bad Gateway", "connection refused")
+                        return
                     resp_line = f"{req.version} 200 Connection Established\r\n"
                     resp_line += f"Via: 1.1 z5592060\r\nConnection: close\r\n\r\n"
                     client_conn.sendall(resp_line.encode('ascii'))
+
+                    dummy_response = HTTPResponse(req.version, 200, "Connection Established")
+                    dummy_response.body = b''
+                    entry = generate_clf_entry(
+                        req,
+                        dummy_response,
+                        client_conn.getpeername(),
+                        cache_flag='-'
+                    )
+                    print(entry)
+                    with lock:
+                        with open('log.log', 'a') as log_file:
+                            log_file.write(entry + '\n')
+
                     sockets = [client_conn, server_sock]
                     # loop to constantly send and receive data
                     while True:
@@ -231,14 +289,29 @@ def handle_client(client_conn: socket.socket):
                 host = host_port; port = 80
             req.headers['Host'] = host_port
 
+            if host in (HOST, '127.0.0.1', 'localhost') and port == PORT:
+                send_error_response(client_conn, req.version, 421, "Misdirected Request", "proxy address")
+                return
+
             # rebuild the request line and forward it to the server
             request_line = f"{req.method} {path} {req.version}\r\n"
             hdrs = ''.join(f"{k}: {v}\r\n" for k,v in req.headers.items())
             forward_data = (request_line + hdrs + '\r\n').encode('ascii') + req.body
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
                 server_sock.settimeout(TIMEOUT)
-                server_sock.connect((host, port))
-
+                try: 
+                    server_sock.connect((host, port))
+                except socket.timeout:
+                    print(f"Timeout while connecting to {host}:{port}")
+                    send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                    return
+                except ConnectionRefusedError:
+                    send_error_response(client_conn, req.version, 502, "Bad Gateway", "connection refused")
+                    return
+                except socket.gaierror:
+                    send_error_response(client_conn, req.version, 502, "Bad Gateway", "could not resolve")
+                    return
+                
                 if VERBOSE:
                     print("----------------- FORWARDING REQUEST TO ORIGIN -----------------")
                     print(f"[{thread_name}] Origin: {host}:{port}")
@@ -250,8 +323,13 @@ def handle_client(client_conn: socket.socket):
 
                 server_sock.sendall(forward_data)
 
-                # receive response from server
-                resp_hdr_buf = recv_until(server_sock)
+                try:
+                    # receive response from server
+                    resp_hdr_buf = recv_until(server_sock)
+                except socket.timeout:
+                    send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                    return
+                
                 head_s, rest = _split_head_body(resp_hdr_buf)
                 res = parse_http_response(resp_hdr_buf)
                 body_buf = bytearray(rest)
@@ -265,17 +343,32 @@ def handle_client(client_conn: socket.socket):
                         total = int(res.headers['Content-Length'])
                         needed = total - len(rest)
                         if needed > 0:
-                            body_buf.extend(recv_exact(server_sock, needed))
+                            try:
+                                body_buf.extend(recv_exact(server_sock, needed))
+                            except socket.timeout:
+                                send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                                return
+                        
+                        if len(body_buf) < total:
+                            send_error_response(client_conn, req.version, 502, "Bad Gateway", "closed unexpectedly")
+                            return
+
                         full_body = bytes(body_buf)
                     # if Transfer-Encoding is chunked, read chunks until size 0
                     elif res.headers.get('Transfer-Encoding','').lower() == 'chunked':
                         buf = body_buf
                         while True:
                             raw = recv_until(server_sock, b'\r\n')
-                            line, rest = raw.split(b'\r\n', 1)      # line == b'171', rest == the start of the JSON
-                            size = int(line.split(b';',1)[0], 16)  # now size == 0x171 == 369
+                            if not raw:
+                                send_error_response(client_conn, req.version, 502, "Bad Gateway", "closed unexpectedly")
+                                return
+                            line, rest = raw.split(b'\r\n', 1)
+                            size = int(line.split(b';',1)[0], 16)
                             buf.extend(rest)
-                            chunk = recv_exact(server_sock, size - len(rest) + 2)  # +2 for the trailing CRLF
+                            chunk = recv_exact(server_sock, size - len(rest) + 2)
+                            if len(chunk) < size + 2:
+                                send_error_response(client_conn, req.version, 502, "Bad Gateway", "closed unexpectedly")
+                                return
                             buf.extend(chunk)
 
                             if size == 0:
@@ -291,13 +384,16 @@ def handle_client(client_conn: socket.socket):
                             if not chunk: break
                             body_buf.extend(chunk)
                         full_body = bytes(body_buf)
+                except socket.timeout:
+                    send_error_response(client_conn, req.version, 504, "Gateway Timeout", "timed out")
+                    return
                 except Exception as e:
                     print(f"Error reading response body: {e}")
                     traceback.print_exc()
                     full_body = b''
 
             if VERBOSE:
-                print("----------------- RECIEVED RESPONSE FROM ORIGIN -----------------")
+                print("----------------- RECEIVED RESPONSE FROM ORIGIN -----------------")
                 print(f"[{thread_name}] Origin: {host}:{port}")
                 print(f"Response: {res}")
                 print("Headers:")
@@ -338,8 +434,9 @@ def handle_client(client_conn: socket.socket):
             # log the request and response
             log_entry = generate_clf_entry(req, res, client_conn.getpeername(), cache_flag)
             print(log_entry)
-            with open('log.log', 'a') as log_file:
-                log_file.write(log_entry + '\n')
+            with lock:
+                with open('log.log', 'a') as log_file:
+                    log_file.write(log_entry + '\n')
 
             if end_conn:
                 break
@@ -369,7 +466,8 @@ def main():
                     client_conn, client_addr = proxy_sock.accept()
                 except socket.timeout:
                     continue
-                print(f"Accepted connection from {client_addr}")
+                if VERBOSE:
+                    print(f"Accepted connection from {client_addr}")
 
                 # start a new thread for concurrency
                 thread = threading.Thread(
@@ -378,7 +476,8 @@ def main():
                     daemon=True
                 )
                 thread.start()
-                print(f"Started thread {thread.name} for client {client_addr}")
+                if VERBOSE:
+                    print(f"Started thread {thread.name} for client {client_addr}")
         except KeyboardInterrupt:
             print("\nShutting down server... (Ctrl+C)")
             
