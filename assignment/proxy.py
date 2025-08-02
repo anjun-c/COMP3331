@@ -5,6 +5,7 @@ from typing import Dict, Tuple
 import traceback
 import json
 import threading
+import time
 
 # parse cli arguments
 if len(sys.argv) != 5:
@@ -15,6 +16,7 @@ PORT = int(sys.argv[1])
 TIMEOUT = int(sys.argv[2])
 MAX_OBJECT_SIZE = int(sys.argv[3])
 MAX_CACHE_SIZE = int(sys.argv[4])
+VERBOSE = False  # set to True for more detailed output
 
 # error handling for args
 if not (1 <= PORT <= 65535):
@@ -124,12 +126,27 @@ def split_url(url: str) -> Tuple[str,str]:
     path = '/' + parts[1] if len(parts)==2 else '/'
     return host_port, path
 
+# generate a log entry for the cache log
+def generate_clf_entry(req: HTTPRequest, res: HTTPResponse, client_addr: Tuple[str, int], cache_flag: str) -> str:
+    ip, port = client_addr
+    timestamp = time.strftime('%d/%b/%Y:%H:%M:%S %z', time.localtime())
+    request_line = f"{req.method} {req.url} {req.version}"
+    body_bytes = len(res.body) if res.body else 0
+
+    return (
+        f"{ip} {port} {cache_flag} "
+        f"[{timestamp}] \"{request_line}\" "
+        f"{res.status_code} {body_bytes}"
+    )
+
 # handle client connection
 def handle_client(client_conn: socket.socket):
     try:
         client_conn.settimeout(TIMEOUT)
         # loop for persistence
         while True:
+            thread_name = threading.current_thread().name
+
             # read request from client
             try:
                 req_buf = recv_until(client_conn)
@@ -152,13 +169,22 @@ def handle_client(client_conn: socket.socket):
 
             client_conn_hdr = req.headers.get('Connection')
             client_proxy_hdr = req.headers.get('Proxy-Connection')
+            
+            cache_flag = '-'
+            cache_hit = False
+            if req.method == 'GET':
+                cache_flag = 'H' if cache_hit else 'M'
+            else:
+                cache_flag = '-'
 
-            print("----------------- RECIEVED REQUEST FROM CLIENT -----------------")
-            print(f"Received request: {req}")
-            print("Headers:")
-            print(json.dumps(req.headers, indent=4))
-            print(f"Body: {req.body[:100]}... (truncated if long)")
-            print("\n")
+            if VERBOSE:
+                print("----------------- RECIEVED REQUEST FROM CLIENT -----------------")
+                print(f"[{thread_name}] Client: {client_conn.getpeername()}")
+                print(f"Received request: {req}")
+                print(f"Headers:")
+                print(f"{json.dumps(req.headers, indent=4)}")
+                print(f"Body: {req.body[:100]}... (truncated if long)")
+                print("\n")
 
             # handle connect method
             if req.method == 'CONNECT':
@@ -213,12 +239,14 @@ def handle_client(client_conn: socket.socket):
                 server_sock.settimeout(TIMEOUT)
                 server_sock.connect((host, port))
 
-                print("----------------- FORWARDING REQUEST TO ORIGIN -----------------")
-                print(f"Forwarding request: {req}")
-                print("Headers:")
-                print(json.dumps(req.headers, indent=4))
-                print(f"Body: {req.body[:100]}... (truncated if long)")
-                print("\n")
+                if VERBOSE:
+                    print("----------------- FORWARDING REQUEST TO ORIGIN -----------------")
+                    print(f"[{thread_name}] Origin: {host}:{port}")
+                    print(f"Forwarding request: {req}")
+                    print("Headers:")
+                    print(json.dumps(req.headers, indent=4))
+                    print(f"Body: {req.body[:100]}... (truncated if long)")
+                    print("\n")
 
                 server_sock.sendall(forward_data)
 
@@ -268,12 +296,14 @@ def handle_client(client_conn: socket.socket):
                     traceback.print_exc()
                     full_body = b''
 
-            print("----------------- RECIEVED RESPONSE FROM ORIGIN -----------------")
-            print(f"Response: {res}")
-            print("Headers:")
-            print(json.dumps(res.headers, indent=4))
-            print(f"Body: {full_body[:100]}... (truncated if long)")
-            print("\n")
+            if VERBOSE:
+                print("----------------- RECIEVED RESPONSE FROM ORIGIN -----------------")
+                print(f"[{thread_name}] Origin: {host}:{port}")
+                print(f"Response: {res}")
+                print("Headers:")
+                print(json.dumps(res.headers, indent=4))
+                print(f"Body: {full_body[:100]}... (truncated if long)")
+                print("\n")
 
             # send response back to client
             res.headers.pop('Proxy-Connection', None)
@@ -295,16 +325,24 @@ def handle_client(client_conn: socket.socket):
             status = f"{res.version} {res.status_code} {res.reason}\r\n"
             hdr_lines = ''.join(f"{k}: {v}\r\n" for k,v in res.headers.items())
             client_conn.sendall(status.encode('ascii') + hdr_lines.encode('ascii') + b"\r\n" + full_body)
+            
+            if VERBOSE:
+                print("----------------- FORWARDING RESPONSE TO CLIENT -----------------")
+                print(f"[{thread_name}] Client: {client_conn.getpeername()}")
+                print(f"Response: {res}")
+                print("Headers:")
+                print(json.dumps(res.headers, indent=4))
+                print(f"Body: {full_body[:100]}... (truncated if long)")
+                print("\n")
+
+            # log the request and response
+            log_entry = generate_clf_entry(req, res, client_conn.getpeername(), cache_flag)
+            print(log_entry)
+            with open('log.log', 'a') as log_file:
+                log_file.write(log_entry + '\n')
 
             if end_conn:
                 break
-
-            print("----------------- FORWARDING RESPONSE TO CLIENT -----------------")
-            print(f"Response: {res}")
-            print("Headers:")
-            print(json.dumps(res.headers, indent=4))
-            print(f"Body: {full_body[:100]}... (truncated if long)")
-            print("\n")
     except Exception as e:
         print(f"Error handling client: {e}")
         traceback.print_exc()
@@ -331,8 +369,16 @@ def main():
                     client_conn, client_addr = proxy_sock.accept()
                 except socket.timeout:
                     continue
-                print(f"Accepted connection from {client_addr}")  # log every new TCP handshake
-                handle_client(client_conn)
+                print(f"Accepted connection from {client_addr}")
+
+                # start a new thread for concurrency
+                thread = threading.Thread(
+                    target=handle_client, 
+                    args=(client_conn,), 
+                    daemon=True
+                )
+                thread.start()
+                print(f"Started thread {thread.name} for client {client_addr}")
         except KeyboardInterrupt:
             print("\nShutting down server... (Ctrl+C)")
             
